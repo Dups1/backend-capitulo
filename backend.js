@@ -244,6 +244,32 @@ function crearPayloadEmailLink(email, actionCodeSettings) {
   };
 }
 
+async function enviarVinculoAccesoEmail(email, estado = {}) {
+  const actionCodeSettings = crearActionCodeSettings({
+    email,
+    flujo: 'email-link-sign-in',
+    ...estado,
+  });
+
+  const response = await fetch(firebaseAuthUrl('accounts:sendOobCode'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(crearPayloadEmailLink(email, actionCodeSettings)),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const codigoFirebase = data?.error?.message;
+    const error = new Error(mapearErrorEmailLink(codigoFirebase));
+    error.status = response.status;
+    error.firebaseError = codigoFirebase;
+    throw error;
+  }
+
+  return { data, actionCodeSettings };
+}
+
 function decodificarEstadoEmailLink(state = '') {
   if (!state) return {};
 
@@ -383,7 +409,12 @@ async function asegurarPerfilUsuarioEmailLink(sesion) {
 
   const ref = db.collection('usuarios').doc(uid);
   const doc = await ref.get();
-  const userRecord = await admin.auth().getUser(uid);
+  let userRecord = await admin.auth().getUser(uid);
+
+  if (!userRecord.emailVerified) {
+    userRecord = await admin.auth().updateUser(uid, { emailVerified: true });
+  }
+
   const nombre = userRecord.displayName || doc.data()?.nombre || null;
 
   const perfilUsuario = {
@@ -460,7 +491,7 @@ async function authenticateToken(req, res, next) {
 }
 
 // ─── Auth: Registro exclusivo con número de control ──────────────────────────
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', ensureApiKey, async (req, res) => {
   if (rechazarEmailManual(req, res)) return;
 
   const {
@@ -505,6 +536,7 @@ app.post('/auth/register', async (req, res) => {
       avatar: crearIniciales(nombre),
       rol,
       carrera,
+      emailVerified: false,
       semestre: semestre ?? null,
       categoria: categoria ?? null,
       subcategoria: subcategoria ?? null,
@@ -514,17 +546,57 @@ app.post('/auth/register', async (req, res) => {
 
     await db.collection('usuarios').doc(userRecord.uid).set(perfilUsuario);
 
+    try {
+      await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro' });
+    } catch (errorEmailLink) {
+      console.error('Register email link error', errorEmailLink);
+      return res.status(201).json({
+        uid: userRecord.uid,
+        email,
+        numeroControl,
+        nombre: perfilUsuario.nombre,
+        rol,
+        requiereVerificacion: true,
+        emailLinkSent: false,
+        warning: 'Cuenta creada, pero no se pudo enviar el vínculo de verificación. Intenta solicitarlo nuevamente.',
+        firebaseError: errorEmailLink.firebaseError,
+      });
+    }
+
     res.status(201).json({
       uid: userRecord.uid,
       email,
       numeroControl,
       nombre: perfilUsuario.nombre,
       rol,
+      requiereVerificacion: true,
+      emailLinkSent: true,
+      message: 'Cuenta creada. Revisa tu correo institucional para confirmar el acceso antes de iniciar sesión.',
     });
   } catch (err) {
     console.error('Auth register error', err);
 
     if (err.code === 'auth/email-already-exists') {
+      try {
+        const userRecord = await admin.auth().getUserByEmail(email);
+
+        if (!userRecord.emailVerified) {
+          await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro-reenvio' });
+          return res.status(200).json({
+            uid: userRecord.uid,
+            email,
+            numeroControl,
+            nombre: userRecord.displayName || null,
+            rol,
+            requiereVerificacion: true,
+            emailLinkSent: true,
+            message: 'La cuenta ya existía y aún no está verificada. Te enviamos un nuevo vínculo de confirmación.',
+          });
+        }
+      } catch (errorReenvio) {
+        console.error('Register resend email link error', errorReenvio);
+      }
+
       return res.status(409).json({ error: 'Número de control ya registrado' });
     }
 
@@ -564,6 +636,25 @@ app.post('/auth/login', ensureApiKey, async (req, res) => {
       return res.status(response.status).json({
         error: mapearErrorIdentityToolkit(codigoFirebase),
         firebaseError: codigoFirebase,
+      });
+    }
+
+    const userRecord = data.localId
+      ? await admin.auth().getUser(data.localId)
+      : await admin.auth().getUserByEmail(email);
+
+    if (!userRecord.emailVerified) {
+      try {
+        await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'login-reenvio' });
+      } catch (errorEmailLink) {
+        console.error('Login resend email link error', errorEmailLink);
+      }
+
+      return res.status(403).json({
+        error: 'Debes confirmar tu correo institucional antes de iniciar sesión. Te enviamos un nuevo vínculo de verificación.',
+        emailVerificationRequired: true,
+        email,
+        numeroControl,
       });
     }
 
