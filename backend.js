@@ -136,7 +136,22 @@ const s3 = new S3Client({
 
 const B2_BUCKET = process.env.B2_BUCKET_NAME;
 const B2_PUBLIC_BASE_URL = process.env.B2_PUBLIC_BASE_URL?.replace(/\/$/, '') ?? '';
-const upload = multer({ storage: multer.memoryStorage() });
+const MAX_PROFILE_IMAGE_BYTES = 1 * 1024 * 1024; // 1 MB
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_PROFILE_IMAGE_BYTES,
+    files: 1,
+    fields: 0,
+  },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype?.startsWith('image/')) {
+      return cb(new Error('Solo se permiten archivos de imagen'));
+    }
+    cb(null, true);
+  },
+});
 
 console.log('B2 config:', {
   endpoint: process.env.B2_ENDPOINT,
@@ -621,6 +636,19 @@ app.delete('/storage/:key', async (req, res) => {
 // ─── Estado del backend ───────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ─── Manejo de errores de multer ────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'La imagen debe pesar máximo 1 MB' });
+  }
+
+  if (err.message === 'Solo se permiten archivos de imagen') {
+    return res.status(400).json({ error: err.message });
+  }
+
+  next(err);
 });
 
 // ─── Servidor ─────────────────────────────────────────────────────────────────
