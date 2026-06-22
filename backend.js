@@ -1,5 +1,7 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
+const sharp = require('sharp');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const multer = require('multer');
@@ -474,38 +476,103 @@ app.post('/firebase/:coleccion/batch', async (req, res) => {
   }
 });
 
-// ─── Backblaze B2: Subir archivo ─────────────────────────────────────────────
-app.post('/storage/upload', upload.single('file'), async (req, res) => {
+// ─── Helpers: compresión de imagen de perfil ────────────────────────────────
+const PROFILE_IMAGE_SIZE = Number(process.env.PROFILE_IMAGE_SIZE || 512);
+const PROFILE_IMAGE_QUALITY = Number(process.env.PROFILE_IMAGE_QUALITY || 78);
+
+function calcularReduccionPorcentaje(originalSize, compressedSize) {
+  if (!originalSize || !compressedSize || compressedSize >= originalSize) return 0;
+  return Math.round((1 - compressedSize / originalSize) * 100);
+}
+
+async function comprimirImagenPerfil(file) {
+  const resultado = await sharp(file.buffer, { failOn: 'none' })
+    .rotate()
+    .resize({
+      width: PROFILE_IMAGE_SIZE,
+      height: PROFILE_IMAGE_SIZE,
+      fit: 'cover',
+      position: 'attention',
+    })
+    .webp({
+      quality: PROFILE_IMAGE_QUALITY,
+      effort: 4,
+    })
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    buffer: resultado.data,
+    size: resultado.data.length,
+    width: resultado.info.width,
+    height: resultado.info.height,
+    contentType: 'image/webp',
+    extension: 'webp',
+  };
+}
+
+// ─── Backblaze B2: Subir imagen de perfil comprimida ─────────────────────────
+app.post('/storage/upload', authenticateToken, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se recibio archivo' });
 
-  const key = `${Date.now()}-${req.file.originalname}`;
+  if (!req.file.mimetype?.startsWith('image/')) {
+    return res.status(400).json({ error: 'Solo se permiten archivos de imagen' });
+  }
 
-  console.log('Upload request start:', {
+  console.log('Upload profile image start:', {
+    uid: req.firebaseUid,
     name: req.file.originalname,
-    size: req.file.size,
-    fieldname: req.file.fieldname,
+    originalSize: req.file.size,
+    mimeType: req.file.mimetype,
   });
 
   try {
-    console.log('Uploading to b2', key);
+    const imagenComprimida = await comprimirImagenPerfil(req.file);
+    const key = `perfiles/${req.firebaseUid}-${Date.now()}-${crypto.randomUUID()}.${imagenComprimida.extension}`;
 
     await s3.send(new PutObjectCommand({
       Bucket: B2_BUCKET,
       Key: key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype,
+      Body: imagenComprimida.buffer,
+      ContentType: imagenComprimida.contentType,
+      CacheControl: 'public, max-age=31536000, immutable',
     }));
 
     const url = `${B2_PUBLIC_BASE_URL}/${key}`;
+    const reduccionPorcentaje = calcularReduccionPorcentaje(req.file.size, imagenComprimida.size);
+
     const docRef = await db.collection('laboratorio_uploads').add({
+      tipo: 'foto_perfil',
+      uid: req.firebaseUid,
+      numeroControl: req.numeroControl,
       key,
       url,
       originalName: req.file.originalname,
+      originalMimeType: req.file.mimetype,
+      mimeType: imagenComprimida.contentType,
+      originalSize: req.file.size,
+      compressedSize: imagenComprimida.size,
+      reduccionPorcentaje,
+      width: imagenComprimida.width,
+      height: imagenComprimida.height,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log('Upload saved to Firestore', { id: docRef.id, url, bucket: B2_BUCKET, key });
-    res.json({ key, url, docId: docRef.id });
+    console.log('Profile image uploaded', {
+      id: docRef.id,
+      url,
+      originalSize: req.file.size,
+      compressedSize: imagenComprimida.size,
+      reduccionPorcentaje,
+    });
+
+    res.json({
+      key,
+      url,
+      docId: docRef.id,
+      originalSize: req.file.size,
+      compressedSize: imagenComprimida.size,
+      reduccionPorcentaje,
+    });
   } catch (err) {
     console.error('Upload failed', err);
     res.status(500).json({ error: err.message });
