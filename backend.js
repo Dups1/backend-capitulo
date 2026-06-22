@@ -651,15 +651,24 @@ app.post('/auth/login', ensureApiKey, async (req, res) => {
       : await admin.auth().getUserByEmail(email);
 
     if (!userRecord.emailVerified) {
+      let emailSent = false;
+      let emailError = null;
+
       try {
         await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'login-reenvio' });
+        emailSent = true;
       } catch (errorEmailLink) {
         console.error('Login resend email link error', errorEmailLink);
+        emailError = errorEmailLink.message || errorEmailLink.firebaseError || 'Error desconocido';
       }
 
       return res.status(403).json({
-        error: 'Debes confirmar tu correo institucional antes de iniciar sesión. Te enviamos un nuevo vínculo de verificación.',
+        error: emailSent
+          ? 'Debes confirmar tu correo institucional antes de iniciar sesión. Te enviamos un nuevo vínculo de verificación.'
+          : `Debes confirmar tu correo institucional antes de iniciar sesión. No se pudo enviar el vínculo de verificación: ${emailError}`,
         emailVerificationRequired: true,
+        emailSent,
+        ...(emailError ? { emailError } : {}),
         email,
         numeroControl,
       });
