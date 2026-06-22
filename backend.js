@@ -11,6 +11,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: false, limit: '20kb' }));
 
 // ─── Helpers generales ───────────────────────────────────────────────────────
 const NUMERO_CONTROL_REGEX = /^\d{8}$/;
@@ -24,6 +25,14 @@ function normalizarNumeroControl(numeroControl = '') {
 function crearCorreoInstitucional(numeroControl = '') {
   const numeroLimpio = normalizarNumeroControl(numeroControl);
   return numeroLimpio ? `${CORREO_PREFIX}.${numeroLimpio}@${CORREO_DOMAIN}`.toLowerCase() : '';
+}
+
+function normalizarEmail(email = '') {
+  return String(email ?? '').trim().toLowerCase();
+}
+
+function validarEmailBasico(email = '') {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizarEmail(email));
 }
 
 function escaparRegex(valor = '') {
@@ -90,6 +99,25 @@ function mapearErrorIdentityToolkit(codigo = '') {
   };
 
   return mensajes[codigo] || 'No se pudo iniciar sesión';
+}
+
+function mapearErrorEmailLink(codigo = '') {
+  const mensajes = {
+    INVALID_EMAIL: 'El correo electrónico no es válido',
+    MISSING_EMAIL: 'Correo electrónico obligatorio',
+    EMAIL_NOT_FOUND: 'No existe una cuenta con ese correo electrónico',
+    EXPIRED_OOB_CODE: 'El vínculo de acceso expiró. Solicita uno nuevo',
+    INVALID_OOB_CODE: 'El vínculo de acceso no es válido o ya fue utilizado',
+    OPERATION_NOT_ALLOWED: 'El inicio de sesión por vínculo de correo no está habilitado en Firebase Authentication',
+    INVALID_CONTINUE_URI: 'La URL de continuación del vínculo no es válida',
+    MISSING_CONTINUE_URI: 'Falta la URL de continuación para el vínculo de acceso',
+    UNAUTHORIZED_CONTINUE_URI: 'El dominio de la URL de continuación no está autorizado en Firebase Authentication',
+    UNAUTHORIZED_DOMAIN: 'El dominio de la URL no está autorizado en Firebase Authentication',
+    INVALID_DYNAMIC_LINK_DOMAIN: 'El dominio Dynamic Link configurado no es válido',
+    TOO_MANY_ATTEMPTS_TRY_LATER: 'Demasiados intentos. Espera un momento e inténtalo nuevamente',
+  };
+
+  return mensajes[codigo] || 'No se pudo enviar el vínculo de acceso';
 }
 
 // ─── Firebase Admin ───────────────────────────────────────────────────────────
@@ -162,11 +190,239 @@ console.log('B2 config:', {
 
 // ─── Variables de entorno Firebase Auth ──────────────────────────────────────
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL?.replace(/\/$/, '') || 'https://backend-capitulo.onrender.com';
+const EMAIL_SIGNIN_CALLBACK_PATH = process.env.EMAIL_SIGNIN_CALLBACK_PATH || '/auth/email-link/callback';
+const EMAIL_SIGNIN_CONTINUE_URL = process.env.EMAIL_SIGNIN_CONTINUE_URL || `${BACKEND_PUBLIC_URL}${EMAIL_SIGNIN_CALLBACK_PATH}`;
+const EMAIL_SIGNIN_DYNAMIC_LINK_DOMAIN = process.env.EMAIL_SIGNIN_DYNAMIC_LINK_DOMAIN || '';
+const EMAIL_SIGNIN_ALLOW_EXTERNAL_EMAILS = process.env.EMAIL_SIGNIN_ALLOW_EXTERNAL_EMAILS === 'true';
+const AUTH_COOKIE_SECURE = process.env.AUTH_COOKIE_SECURE !== 'false';
+const AUTH_COOKIE_SAME_SITE = process.env.AUTH_COOKIE_SAME_SITE || 'lax';
+const AUTH_REFRESH_COOKIE_MAX_AGE_MS = Number(process.env.AUTH_REFRESH_COOKIE_MAX_AGE_MS || 1000 * 60 * 60 * 24 * 30);
 
 const firebaseAuthUrl = (path) => {
   if (!FIREBASE_API_KEY) return '';
   return `https://identitytoolkit.googleapis.com/v1/${path}?key=${FIREBASE_API_KEY}`;
 };
+
+function obtenerEmailParaVinculoAcceso(body = {}) {
+  const email = normalizarEmail(body.email);
+
+  if (email) return { email };
+
+  const numeroControl = obtenerNumeroControlObligatorio(body);
+  const errorNumeroControl = validarNumeroControl(numeroControl);
+
+  if (errorNumeroControl) {
+    return { error: 'Ingresa un correo electrónico válido o un número de control de 8 dígitos' };
+  }
+
+  return { email: crearCorreoInstitucional(numeroControl) };
+}
+
+function crearActionCodeSettings(estado = null) {
+  const url = new URL(EMAIL_SIGNIN_CONTINUE_URL);
+
+  if (estado && typeof estado === 'object') {
+    const estadoCodificado = Buffer.from(JSON.stringify(estado)).toString('base64url');
+    url.searchParams.set('state', estadoCodificado);
+  }
+
+  return {
+    url: url.toString(),
+    handleCodeInApp: true,
+    ...(EMAIL_SIGNIN_DYNAMIC_LINK_DOMAIN ? { dynamicLinkDomain: EMAIL_SIGNIN_DYNAMIC_LINK_DOMAIN } : {}),
+  };
+}
+
+function crearPayloadEmailLink(email, actionCodeSettings) {
+  return {
+    requestType: 'EMAIL_SIGNIN',
+    email,
+    continueUrl: actionCodeSettings.url,
+    canHandleCodeInApp: actionCodeSettings.handleCodeInApp,
+    ...(actionCodeSettings.dynamicLinkDomain ? { dynamicLinkDomain: actionCodeSettings.dynamicLinkDomain } : {}),
+  };
+}
+
+function decodificarEstadoEmailLink(state = '') {
+  if (!state) return {};
+
+  try {
+    return JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function escaparHtml(valor = '') {
+  return String(valor ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function crearHtmlEmailLink({ titulo, mensaje, detalle = '', usuario = null, exito = true }) {
+  const color = exito ? '#22c55e' : '#f43f5e';
+  const estado = exito ? 'Autenticación completada' : 'No se pudo completar la autenticación';
+  const usuarioHtml = usuario
+    ? `<dl class="details"><dt>Correo</dt><dd>${escaparHtml(usuario.email)}</dd><dt>Número de control</dt><dd>${escaparHtml(usuario.numeroControl || 'No disponible')}</dd></dl>`
+    : '';
+
+  return `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escaparHtml(titulo)}</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: radial-gradient(circle at top, #1e1b4b, #020617 58%); color: #e2e8f0; }
+      main { width: min(92vw, 520px); border: 1px solid rgba(148, 163, 184, .24); border-radius: 28px; padding: 32px; background: rgba(15, 23, 42, .78); box-shadow: 0 24px 80px rgba(2, 6, 23, .5); }
+      .badge { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 12px; background: ${color}22; color: ${color}; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+      h1 { margin: 18px 0 10px; font-size: clamp(26px, 5vw, 38px); line-height: 1.05; }
+      p { margin: 0; color: #94a3b8; line-height: 1.65; }
+      .details { display: grid; gap: 8px; margin-top: 22px; padding: 16px; border-radius: 18px; background: rgba(15, 23, 42, .9); border: 1px solid rgba(148, 163, 184, .16); }
+      dt { color: #67e8f9; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+      dd { margin: 0 0 8px; color: #e2e8f0; word-break: break-word; }
+      small { display: block; margin-top: 18px; color: #64748b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="badge">${escaparHtml(estado)}</span>
+      <h1>${escaparHtml(titulo)}</h1>
+      <p>${escaparHtml(mensaje)}</p>
+      ${detalle ? `<small>${escaparHtml(detalle)}</small>` : ''}
+      ${usuarioHtml}
+    </main>
+  </body>
+</html>`;
+}
+
+function crearHtmlFormularioEmailLink({ oobCode = '', state = '', error = '' }) {
+  return `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Completar acceso</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: radial-gradient(circle at top, #1e1b4b, #020617 58%); color: #e2e8f0; }
+      main { width: min(92vw, 520px); border: 1px solid rgba(148, 163, 184, .24); border-radius: 28px; padding: 32px; background: rgba(15, 23, 42, .78); box-shadow: 0 24px 80px rgba(2, 6, 23, .5); }
+      h1 { margin: 0 0 10px; font-size: clamp(26px, 5vw, 38px); line-height: 1.05; }
+      p { margin: 0 0 22px; color: #94a3b8; line-height: 1.65; }
+      label { display: block; margin-bottom: 8px; color: #67e8f9; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+      input { box-sizing: border-box; width: 100%; border-radius: 16px; border: 1px solid rgba(148, 163, 184, .25); background: rgba(15, 23, 42, .9); color: #e2e8f0; padding: 14px 16px; font: inherit; outline: none; }
+      input:focus { border-color: #22d3ee; box-shadow: 0 0 0 4px rgba(34, 211, 238, .12); }
+      button { width: 100%; margin-top: 16px; border: 0; border-radius: 16px; padding: 14px 16px; background: linear-gradient(135deg, #8b5cf6, #06b6d4); color: white; font-weight: 800; cursor: pointer; }
+      .error { margin-bottom: 16px; border-radius: 14px; padding: 12px 14px; background: rgba(244, 63, 94, .12); color: #fecdd3; border: 1px solid rgba(244, 63, 94, .28); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Completa tu acceso</h1>
+      <p>Por seguridad, confirma el correo al que se envió este vínculo.</p>
+      ${error ? `<div class="error">${escaparHtml(error)}</div>` : ''}
+      <form method="post" action="${escaparHtml(EMAIL_SIGNIN_CALLBACK_PATH)}">
+        <input type="hidden" name="oobCode" value="${escaparHtml(oobCode)}" />
+        <input type="hidden" name="state" value="${escaparHtml(state)}" />
+        <label for="email">Correo electrónico</label>
+        <input id="email" name="email" type="email" autocomplete="email" required placeholder="alu.12345678@${escaparHtml(CORREO_DOMAIN)}" />
+        <button type="submit">Validar vínculo</button>
+      </form>
+    </main>
+  </body>
+</html>`;
+}
+
+function establecerCookiesSesion(res, sesion) {
+  const maxAgeIdToken = Number(sesion.expiresIn || 3600) * 1000;
+  const opcionesBase = {
+    httpOnly: true,
+    secure: AUTH_COOKIE_SECURE,
+    sameSite: AUTH_COOKIE_SAME_SITE,
+    path: '/',
+  };
+
+  res.cookie('capitulo_id_token', sesion.idToken, { ...opcionesBase, maxAge: maxAgeIdToken });
+  if (sesion.refreshToken) {
+    res.cookie('capitulo_refresh_token', sesion.refreshToken, { ...opcionesBase, maxAge: AUTH_REFRESH_COOKIE_MAX_AGE_MS });
+  }
+}
+
+async function iniciarSesionConEmailLink(email, oobCode) {
+  const response = await fetch(firebaseAuthUrl('accounts:signInWithEmailLink'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, oobCode }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const codigoFirebase = data?.error?.message;
+    const error = new Error(mapearErrorEmailLink(codigoFirebase));
+    error.status = response.status;
+    error.firebaseError = codigoFirebase;
+    throw error;
+  }
+
+  return data;
+}
+
+async function asegurarPerfilUsuarioEmailLink(sesion) {
+  const uid = sesion.localId;
+  const email = normalizarEmail(sesion.email);
+  const numeroControl = obtenerNumeroControlDesdeCorreoInstitucional(email);
+
+  if (!uid) throw new Error('Firebase no devolvió UID para la sesión');
+  if (!numeroControl) throw new Error('El correo autenticado no pertenece al dominio institucional permitido');
+
+  const ref = db.collection('usuarios').doc(uid);
+  const doc = await ref.get();
+  const userRecord = await admin.auth().getUser(uid);
+  const nombre = userRecord.displayName || doc.data()?.nombre || null;
+
+  const perfilUsuario = {
+    uid,
+    email,
+    numeroControl,
+    nombre,
+    avatar: doc.data()?.avatar || crearIniciales(nombre),
+    rol: doc.data()?.rol || 'estudiante',
+    carrera: doc.data()?.carrera || 'Ingeniería en Sistemas Computacionales',
+    semestre: doc.data()?.semestre ?? null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...(!doc.exists ? { createdAt: admin.firestore.FieldValue.serverTimestamp() } : {}),
+  };
+
+  await ref.set(perfilUsuario, { merge: true });
+
+  return { id: uid, ...perfilUsuario };
+}
+
+function obtenerParametroEntrada(origen = {}, nombre = '') {
+  const valor = origen[nombre];
+  return Array.isArray(valor) ? valor[0] : valor;
+}
+
+async function completarAutenticacionEmailLink(res, { email, oobCode }) {
+  const sesion = await iniciarSesionConEmailLink(email, oobCode);
+  const usuario = await asegurarPerfilUsuarioEmailLink(sesion);
+
+  establecerCookiesSesion(res, sesion);
+
+  return res.status(200).send(crearHtmlEmailLink({
+    titulo: 'Acceso confirmado',
+    mensaje: 'Tu sesión fue validada correctamente desde el backend.',
+    detalle: 'Puedes cerrar esta pestaña y continuar usando el sistema.',
+    usuario,
+    exito: true,
+  }));
+}
 
 function ensureApiKey(req, res, next) {
   if (!FIREBASE_API_KEY) {
@@ -319,6 +575,140 @@ app.post('/auth/login', ensureApiKey, async (req, res) => {
   } catch (err) {
     console.error('Auth login error', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Auth: Enviar vínculo de acceso por correo ───────────────────────────────
+// Equivalente backend a sendSignInLinkToEmail usando Identity Toolkit REST.
+// Requiere habilitar "Email link (passwordless sign-in)" en Firebase Auth.
+app.post('/auth/email-link', ensureApiKey, async (req, res) => {
+  const { email, error } = obtenerEmailParaVinculoAcceso(req.body);
+
+  if (error) {
+    return res.status(400).json({ error });
+  }
+
+  if (!validarEmailBasico(email)) {
+    return res.status(400).json({ error: 'Correo electrónico no válido' });
+  }
+
+  if (!EMAIL_SIGNIN_ALLOW_EXTERNAL_EMAILS && !obtenerNumeroControlDesdeCorreoInstitucional(email)) {
+    return res.status(400).json({
+      error: `Solo se permiten correos institucionales con formato ${CORREO_PREFIX}.numero@${CORREO_DOMAIN}`,
+    });
+  }
+
+  const actionCodeSettings = crearActionCodeSettings({
+    email,
+    flujo: 'email-link-sign-in',
+  });
+
+  try {
+    const response = await fetch(firebaseAuthUrl('accounts:sendOobCode'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(crearPayloadEmailLink(email, actionCodeSettings)),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      const codigoFirebase = data?.error?.message;
+      return res.status(response.status).json({
+        error: mapearErrorEmailLink(codigoFirebase),
+        firebaseError: codigoFirebase,
+      });
+    }
+
+    res.json({
+      ok: true,
+      email: data.email || email,
+      message: 'Vínculo de acceso enviado al correo electrónico',
+      actionCodeSettings: {
+        url: actionCodeSettings.url,
+        handleCodeInApp: actionCodeSettings.handleCodeInApp,
+        dynamicLinkDomain: actionCodeSettings.dynamicLinkDomain || null,
+      },
+    });
+  } catch (err) {
+    console.error('Email link auth error', err);
+    res.status(500).json({ error: err.message || 'No se pudo enviar el vínculo de acceso' });
+  }
+});
+
+// ─── Auth: Callback público para vínculos de correo ──────────────────────────
+// El backend recibe el vínculo, valida el oobCode con Firebase y deja la sesión
+// en cookies HttpOnly sin depender de una ruta del frontend.
+app.get(EMAIL_SIGNIN_CALLBACK_PATH, ensureApiKey, async (req, res) => {
+  const oobCode = obtenerParametroEntrada(req.query, 'oobCode');
+  const state = obtenerParametroEntrada(req.query, 'state') || '';
+  const estado = decodificarEstadoEmailLink(state);
+  const email = normalizarEmail(obtenerParametroEntrada(req.query, 'email') || estado.email);
+
+  if (!oobCode) {
+    return res.status(400).send(crearHtmlEmailLink({
+      titulo: 'Vínculo incompleto',
+      mensaje: 'El vínculo de acceso no incluye el código de validación de Firebase.',
+      detalle: 'Solicita un nuevo vínculo de acceso e inténtalo nuevamente.',
+      exito: false,
+    }));
+  }
+
+  if (!email) {
+    return res.status(200).send(crearHtmlFormularioEmailLink({ oobCode, state }));
+  }
+
+  try {
+    return await completarAutenticacionEmailLink(res, { email, oobCode });
+  } catch (err) {
+    console.error('Email link callback error', err);
+    return res.status(err.status || 500).send(crearHtmlEmailLink({
+      titulo: 'No se pudo validar el vínculo',
+      mensaje: err.message || 'Ocurrió un problema al completar el acceso desde el backend.',
+      detalle: err.firebaseError ? `Firebase: ${err.firebaseError}` : '',
+      exito: false,
+    }));
+  }
+});
+
+app.post(EMAIL_SIGNIN_CALLBACK_PATH, ensureApiKey, async (req, res) => {
+  const email = normalizarEmail(obtenerParametroEntrada(req.body, 'email'));
+  const oobCode = obtenerParametroEntrada(req.body, 'oobCode');
+  const state = obtenerParametroEntrada(req.body, 'state') || '';
+
+  if (!oobCode) {
+    return res.status(400).send(crearHtmlFormularioEmailLink({
+      oobCode,
+      state,
+      error: 'El vínculo no incluye el código de validación de Firebase.',
+    }));
+  }
+
+  if (!validarEmailBasico(email)) {
+    return res.status(400).send(crearHtmlFormularioEmailLink({
+      oobCode,
+      state,
+      error: 'Ingresa un correo electrónico válido.',
+    }));
+  }
+
+  if (!EMAIL_SIGNIN_ALLOW_EXTERNAL_EMAILS && !obtenerNumeroControlDesdeCorreoInstitucional(email)) {
+    return res.status(400).send(crearHtmlFormularioEmailLink({
+      oobCode,
+      state,
+      error: `Solo se permiten correos institucionales con formato ${CORREO_PREFIX}.numero@${CORREO_DOMAIN}`,
+    }));
+  }
+
+  try {
+    return await completarAutenticacionEmailLink(res, { email, oobCode });
+  } catch (err) {
+    console.error('Email link form callback error', err);
+    return res.status(err.status || 500).send(crearHtmlFormularioEmailLink({
+      oobCode,
+      state,
+      error: err.message || 'No se pudo validar el vínculo de acceso.',
+    }));
   }
 });
 
