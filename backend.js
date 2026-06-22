@@ -475,6 +475,13 @@ async function authenticateToken(req, res, next) {
     const decoded = await admin.auth().verifyIdToken(token);
     const numeroControl = obtenerNumeroControlDesdeCorreoInstitucional(decoded.email);
 
+    if (!decoded.email_verified) {
+      return res.status(403).json({
+        error: 'Debes confirmar tu correo institucional antes de acceder al sistema',
+        emailVerificationRequired: true,
+      });
+    }
+
     if (!numeroControl) {
       return res.status(403).json({
         error: 'El token no pertenece a un correo institucional válido',
