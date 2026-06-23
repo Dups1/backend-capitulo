@@ -5,6 +5,7 @@ const sharp = require('sharp');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -244,7 +245,58 @@ function crearPayloadEmailLink(email, actionCodeSettings) {
   };
 }
 
+// ─── SMTP propio (nodemailer) ───────────────────────────────────────────────
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
+const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Capítulo ISC';
+
+let transporter = null;
+if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+  transporter = nodemailer.createTransport({
+    host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+  });
+  console.log('SMTP configurado:', { host: SMTP_HOST, port: SMTP_PORT, from: SMTP_FROM });
+} else {
+  console.log('SMTP no configurado. Usando Firebase Email Link.');
+}
+
+async function enviarCorreoVerificacionSMTP(email) {
+  if (!transporter) throw new Error('SMTP no configurado');
+  const token = crypto.randomBytes(32).toString('hex');
+  const callbackUrl = new URL(`${BACKEND_PUBLIC_URL}/auth/verify-email`);
+  callbackUrl.searchParams.set('token', token);
+  callbackUrl.searchParams.set('email', email);
+
+  await db.collection('email_verifications').add({
+    email: normalizarEmail(email), token, used: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: new Date(Date.now() + 86400000),
+  });
+
+  const link = escaparHtml(callbackUrl.toString());
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,system-ui,sans-serif;">
+<div style="max-width:520px;margin:24px auto;background:rgba(15,23,42,.78);border:1px solid rgba(148,163,184,.24);border-radius:28px;padding:32px;">
+<p style="color:#67e8f9;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin:0 0 16px;">Capítulo ISC</p>
+<h1 style="color:#e2e8f0;font-size:28px;margin:0 0 12px;">Confirma tu correo</h1>
+<p style="color:#94a3b8;font-size:15px;line-height:1.65;margin:0 0 24px;">Haz clic para confirmar tu correo y completar tu registro.</p>
+<a href="${link}" style="display:inline-block;background:linear-gradient(135deg,#8b5cf6,#06b6d4);color:#fff;font-weight:800;text-decoration:none;padding:14px 24px;border-radius:16px;">Confirmar mi correo</a>
+<p style="color:#64748b;font-size:12px;margin:24px 0 0;">O copia: ${link}</p>
+</div></body></html>`;
+
+  await transporter.sendMail({
+    from: `"${SMTP_FROM_NAME}" <${SMTP_FROM}>`, to: email,
+    subject: 'Confirma tu correo - Capítulo ISC', html,
+  });
+  return { token, callbackUrl: callbackUrl.toString() };
+}
+
 async function enviarVinculoAccesoEmail(email, estado = {}) {
+  if (transporter) return enviarCorreoVerificacionSMTP(email);
   const actionCodeSettings = crearActionCodeSettings({
     email,
     flujo: 'email-link-sign-in',
@@ -815,6 +867,74 @@ app.post(EMAIL_SIGNIN_CALLBACK_PATH, ensureApiKey, async (req, res) => {
       oobCode,
       state,
       error: err.message || 'No se pudo validar el vínculo de acceso.',
+    }));
+  }
+});
+
+// ─── Auth: Verificar correo con token SMTP ──────────────────────────────────
+app.get('/auth/verify-email', async (req, res) => {
+  const token = obtenerParametroEntrada(req.query, 'token') || '';
+  const email = normalizarEmail(obtenerParametroEntrada(req.query, 'email') || '');
+
+  if (!token || !email) {
+    return res.status(400).send(crearHtmlEmailLink({
+      titulo: 'Vínculo incompleto',
+      mensaje: 'Falta el token o el correo electrónico en el vínculo.',
+      exito: false,
+    }));
+  }
+
+  try {
+    const snapshot = await db.collection('email_verifications')
+      .where('token', '==', token)
+      .where('email', '==', email)
+      .where('used', '==', false)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(400).send(crearHtmlEmailLink({
+        titulo: 'Vínculo inválido',
+        mensaje: 'El token no existe, ya fue utilizado o expiró.',
+        exito: false,
+      }));
+    }
+
+    const doc = snapshot.docs[0];
+    const data = doc.data();
+
+    if (data.expiresAt && data.expiresAt.toDate() < new Date()) {
+      return res.status(400).send(crearHtmlEmailLink({
+        titulo: 'Vínculo expirado',
+        mensaje: 'El vínculo de verificación expiró. Solicita uno nuevo.',
+        exito: false,
+      }));
+    }
+
+    await doc.ref.update({ used: true, verifiedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    const userRecord = await admin.auth().getUserByEmail(email);
+    if (!userRecord.emailVerified) {
+      await admin.auth().updateUser(userRecord.uid, { emailVerified: true });
+    }
+
+    await db.collection('usuarios').doc(userRecord.uid).update({
+      emailVerified: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.status(200).send(crearHtmlEmailLink({
+      titulo: 'Correo confirmado',
+      mensaje: 'Tu correo institucional fue confirmado correctamente. Ya puedes iniciar sesión.',
+      detalle: 'Cierra esta pestaña y entra al sistema con tu número de control y contraseña.',
+      exito: true,
+    }));
+  } catch (err) {
+    console.error('Verify email error', err);
+    return res.status(500).send(crearHtmlEmailLink({
+      titulo: 'Error',
+      mensaje: err.message || 'No se pudo verificar el correo.',
+      exito: false,
     }));
   }
 });
