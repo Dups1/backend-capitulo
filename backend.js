@@ -230,84 +230,9 @@ async function enviarCorreoVerificacionResend(email) {
   return { token, callbackUrl: callbackUrl.toString() };
 }
 
-// ─── Envío de correo: usa Resend si está configurado, sino Firebase Email Link ─
-async function enviarVinculoAccesoEmail(email, estado = {}) {
-  if (resendClient) return enviarCorreoVerificacionResend(email);
-
-  // Fallback: Firebase Email Link (Identity Toolkit)
-  const actionCodeSettings = crearActionCodeSettings({
-    email,
-    flujo: 'email-link-sign-in',
-    ...estado,
-  });
-
-  const response = await fetch(firebaseAuthUrl('accounts:sendOobCode'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(crearPayloadEmailLink(email, actionCodeSettings)),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    const codigoFirebase = data?.error?.message;
-    const error = new Error(mapearErrorEmailLink(codigoFirebase));
-    error.status = response.status;
-    error.firebaseError = codigoFirebase;
-    throw error;
-  }
-
-  return { data, actionCodeSettings };
-}
-
-function crearActionCodeSettings(estado = null) {
-  const url = new URL(`${BACKEND_PUBLIC_URL}/auth/email-link/callback`);
-
-  if (estado && typeof estado === 'object') {
-    const estadoCodificado = Buffer.from(JSON.stringify(estado)).toString('base64url');
-    url.searchParams.set('state', estadoCodificado);
-  }
-
-  return {
-    url: url.toString(),
-    handleCodeInApp: true,
-  };
-}
-
-function crearPayloadEmailLink(email, actionCodeSettings) {
-  return {
-    requestType: 'EMAIL_SIGNIN',
-    email,
-    continueUrl: actionCodeSettings.url,
-    canHandleCodeInApp: actionCodeSettings.handleCodeInApp,
-  };
-}
-
-function mapearErrorEmailLink(codigo = '') {
-  const mensajes = {
-    INVALID_EMAIL: 'El correo electrónico no es válido',
-    MISSING_EMAIL: 'Correo electrónico obligatorio',
-    EMAIL_NOT_FOUND: 'No existe una cuenta con ese correo electrónico',
-    EXPIRED_OOB_CODE: 'El vínculo de acceso expiró. Solicita uno nuevo',
-    INVALID_OOB_CODE: 'El vínculo de acceso no es válido o ya fue utilizado',
-    OPERATION_NOT_ALLOWED: 'El inicio de sesión por vínculo de correo no está habilitado en Firebase Authentication',
-    INVALID_CONTINUE_URI: 'La URL de continuación del vínculo no es válida',
-    MISSING_CONTINUE_URI: 'Falta la URL de continuación para el vínculo de acceso',
-    UNAUTHORIZED_CONTINUE_URI: 'El dominio de la URL de continuación no está autorizado en Firebase Authentication',
-    UNAUTHORIZED_DOMAIN: 'El dominio de la URL no está autorizado en Firebase Authentication',
-    INVALID_DYNAMIC_LINK_DOMAIN: 'El dominio Dynamic Link configurado no es válido',
-    TOO_MANY_ATTEMPTS_TRY_LATER: 'Demasiados intentos. Espera un momento e inténtalo nuevamente',
-  };
-  return mensajes[codigo] || 'No se pudo enviar el vínculo de acceso';
-}
-
-function decodificarEstadoEmailLink(state = '') {
-  if (!state) return {};
-  try {
-    return JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
-  } catch (_) {
-    return {};
-  }
+// ─── Envío de correo de verificación (solo Resend) ──────────────────────────
+async function enviarCorreoVerificacion(email) {
+  return enviarCorreoVerificacionResend(email);
 }
 
 function escaparHtml(valor = '') {
