@@ -391,7 +391,7 @@ app.post('/auth/register', ensureApiKey, async (req, res) => {
     await db.collection('usuarios').doc(userRecord.uid).set(perfilUsuario);
 
     try {
-      await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro' });
+      await enviarCorreoVerificacion(email);
       res.status(201).json({
         uid: userRecord.uid,
         email,
@@ -424,7 +424,7 @@ app.post('/auth/register', ensureApiKey, async (req, res) => {
         const userRecord = await admin.auth().getUserByEmail(email);
 
         if (!userRecord.emailVerified) {
-          await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro-reenvio' });
+          await enviarCorreoVerificacion(email);
           return res.status(200).json({
             uid: userRecord.uid,
             email,
@@ -491,7 +491,7 @@ app.post('/auth/login', ensureApiKey, async (req, res) => {
       let emailError = null;
 
       try {
-        await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'login-reenvio' });
+        await enviarCorreoVerificacion(email);
         emailSent = true;
       } catch (errorEmailLink) {
         console.error('Login resend email link error', errorEmailLink);
