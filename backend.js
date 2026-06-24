@@ -6,6 +6,7 @@ const admin = require('firebase-admin');
 const cors = require('cors');
 const multer = require('multer');
 const { Resend } = require('resend');
+const { MercadoPagoConfig, Preference } = require('mercadopago');
 const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -166,6 +167,7 @@ console.log('B2 config:', {
 // ─── Variables de entorno Firebase Auth ──────────────────────────────────────
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL?.replace(/\/$/, '') || 'https://backend-capitulo.onrender.com';
+const FRONTEND_PUBLIC_URL = process.env.FRONTEND_PUBLIC_URL?.replace(/\/$/, '') || 'https://capitulo-orange.web.app';
 
 const AUTH_COOKIE_SECURE = process.env.AUTH_COOKIE_SECURE !== 'false';
 const AUTH_COOKIE_SAME_SITE = process.env.AUTH_COOKIE_SAME_SITE || 'lax';
@@ -186,6 +188,18 @@ if (RESEND_API_KEY) {
   console.log('Resend: cliente inicializado');
 } else {
   console.log('Resend: no configurado (falta RESEND_API_KEY)');
+}
+
+// ─── Mercado Pago Checkout Pro ───────────────────────────────────────────────
+const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
+
+let mercadoPagoPreferenceClient = null;
+if (MERCADOPAGO_ACCESS_TOKEN) {
+  const mercadoPagoClient = new MercadoPagoConfig({ accessToken: MERCADOPAGO_ACCESS_TOKEN });
+  mercadoPagoPreferenceClient = new Preference(mercadoPagoClient);
+  console.log('Mercado Pago: cliente Checkout Pro inicializado');
+} else {
+  console.log('Mercado Pago: no configurado (falta MERCADOPAGO_ACCESS_TOKEN)');
 }
 
 // ─── Envío de correo de verificación con Resend ──────────────────────────────
@@ -391,7 +405,7 @@ app.post('/auth/register', ensureApiKey, async (req, res) => {
     await db.collection('usuarios').doc(userRecord.uid).set(perfilUsuario);
 
     try {
-      await enviarCorreoVerificacion(email);
+      await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro' });
       res.status(201).json({
         uid: userRecord.uid,
         email,
@@ -424,7 +438,7 @@ app.post('/auth/register', ensureApiKey, async (req, res) => {
         const userRecord = await admin.auth().getUserByEmail(email);
 
         if (!userRecord.emailVerified) {
-          await enviarCorreoVerificacion(email);
+          await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'registro-reenvio' });
           return res.status(200).json({
             uid: userRecord.uid,
             email,
@@ -491,7 +505,7 @@ app.post('/auth/login', ensureApiKey, async (req, res) => {
       let emailError = null;
 
       try {
-        await enviarCorreoVerificacion(email);
+        await enviarVinculoAccesoEmail(email, { numeroControl, flujo: 'login-reenvio' });
         emailSent = true;
       } catch (errorEmailLink) {
         console.error('Login resend email link error', errorEmailLink);
@@ -597,6 +611,80 @@ app.post('/auth/custom-token', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('custom-token', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Pagos: Mercado Pago Checkout Pro ────────────────────────────────────────
+app.post('/pagos/mercado-pago/preferencia', async (req, res) => {
+  if (!mercadoPagoPreferenceClient) {
+    return res.status(500).json({
+      error: 'Mercado Pago no está configurado. Falta MERCADOPAGO_ACCESS_TOKEN en el backend.',
+    });
+  }
+
+  const { evento = {}, cantidad, comprador, correo } = req.body || {};
+  const eventoId = String(evento.id || '').trim();
+  const nombreEvento = String(evento.nombre || '').trim();
+  const costoUnitario = Number(evento.costo);
+  const cantidadNumerica = Number(cantidad);
+  const compradorNormalizado = String(comprador || '').trim();
+  const correoNormalizado = normalizarEmail(correo || '');
+
+  if (!nombreEvento) return res.status(400).json({ error: 'El evento es obligatorio' });
+  if (!Number.isFinite(costoUnitario) || costoUnitario <= 0) return res.status(400).json({ error: 'El costo del evento no es válido' });
+  if (!Number.isInteger(cantidadNumerica) || cantidadNumerica < 1 || cantidadNumerica > 10) return res.status(400).json({ error: 'La cantidad debe estar entre 1 y 10' });
+  if (!compradorNormalizado) return res.status(400).json({ error: 'El nombre del comprador es obligatorio' });
+  if (!validarEmailBasico(correoNormalizado)) return res.status(400).json({ error: 'El correo del comprador no es válido' });
+
+  const externalReference = `capitulo-${eventoId || 'evento'}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  const retornoFacturacion = `${FRONTEND_PUBLIC_URL}/app/facturacion`;
+
+  try {
+    const preferencia = await mercadoPagoPreferenceClient.create({
+      body: {
+        items: [
+          {
+            id: eventoId || undefined,
+            title: `Asistencia - ${nombreEvento}`,
+            description: 'Compra de asistencia para evento del Capítulo ISC',
+            quantity: cantidadNumerica,
+            unit_price: costoUnitario,
+            currency_id: 'MXN',
+          },
+        ],
+        payer: {
+          name: compradorNormalizado,
+          email: correoNormalizado,
+        },
+        back_urls: {
+          success: `${retornoFacturacion}?estado_pago=aprobado`,
+          failure: `${retornoFacturacion}?estado_pago=fallido`,
+          pending: `${retornoFacturacion}?estado_pago=pendiente`,
+        },
+        auto_return: 'approved',
+        external_reference: externalReference,
+        statement_descriptor: 'CAPITULO ISC',
+        metadata: {
+          evento_id: eventoId,
+          evento_nombre: nombreEvento,
+          comprador: compradorNormalizado,
+          correo: correoNormalizado,
+          cantidad: cantidadNumerica,
+          entorno: 'prueba',
+        },
+      },
+    });
+
+    res.status(201).json({
+      id: preferencia.id,
+      initPoint: preferencia.init_point,
+      sandboxInitPoint: preferencia.sandbox_init_point,
+      checkoutUrl: preferencia.sandbox_init_point || preferencia.init_point,
+      externalReference,
+    });
+  } catch (err) {
+    console.error('Mercado Pago preference error', err);
+    res.status(500).json({ error: err.message || 'No se pudo crear la preferencia de Mercado Pago' });
   }
 });
 
