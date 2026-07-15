@@ -9,6 +9,7 @@ const { Resend } = require('resend');
 const { MercadoPagoConfig, Preference } = require('mercadopago');
 const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const crearAdminRouter = require('./adminRouter');
 
 const app = express();
 app.use(cors());
@@ -354,13 +355,13 @@ app.post('/auth/register', ensureApiKey, async (req, res) => {
 
   const {
     password,
-    rol = 'estudiante',
     categoria,
     subcategoria,
     nombre,
     carrera = 'Ingeniería en Sistemas Computacionales',
     semestre,
   } = req.body;
+  const rol = 'estudiante';
 
   const numeroControl = obtenerNumeroControlObligatorio(req.body);
   const errorNumeroControl = validarNumeroControl(numeroControl);
@@ -615,7 +616,7 @@ app.post('/auth/custom-token', authenticateToken, async (req, res) => {
 });
 
 // ─── Pagos: Mercado Pago Checkout Pro ────────────────────────────────────────
-app.post('/pagos/mercado-pago/preferencia', async (req, res) => {
+app.post('/pagos/mercado-pago/preferencia', authenticateToken, async (req, res) => {
   if (!mercadoPagoPreferenceClient) {
     return res.status(500).json({
       error: 'Mercado Pago no está configurado. Falta MERCADOPAGO_ACCESS_TOKEN en el backend.',
@@ -761,10 +762,13 @@ app.get('/usuarios/me', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── Mesa Directiva: API administrativa con permisos por puesto ─────────────
+app.use('/admin/v1', crearAdminRouter({ db, admin, authenticateToken }));
+
 // ─── Firestore: Laboratorio uploads ─────────────────────────────────────────
-app.get('/firebase/laboratorio', async (req, res) => {
+app.get('/firebase/laboratorio', authenticateToken, async (req, res) => {
   try {
-    const snapshot = await db.collection('laboratorio_uploads').get();
+    const snapshot = await db.collection('laboratorio_uploads').where('uid', '==', req.firebaseUid).get();
     const entries = snapshot.docs.map(doc => {
       const data = doc.data();
       const createdAt = data.createdAt;
@@ -785,13 +789,22 @@ app.get('/firebase/laboratorio', async (req, res) => {
 });
 
 // ─── Firestore: Leer coleccion ───────────────────────────────────────────────
-app.get('/firebase/:coleccion', async (req, res) => {
+app.get('/firebase/:coleccion', authenticateToken, async (req, res) => {
   try {
-    let query = db.collection(req.params.coleccion);
+    const coleccion = req.params.coleccion;
+    if (coleccion === 'usuarios') {
+      const doc = await db.collection('usuarios').doc(req.firebaseUid).get();
+      return res.json(doc.exists ? [{ id: doc.id, ...doc.data() }] : []);
+    }
+    if (coleccion !== 'reservas') {
+      return res.status(403).json({ error: 'Colección no disponible para este acceso' });
+    }
+
+    let query = db.collection('reservas').where('usuarioId', '==', req.firebaseUid);
     const skip = new Set(['limit', 'offset']);
 
     for (const [key, value] of Object.entries(req.query)) {
-      if (!skip.has(key)) query = query.where(key, '==', value);
+      if (!skip.has(key) && key !== 'usuarioId') query = query.where(key, '==', value);
     }
 
     const snapshot = await query.get();
@@ -803,9 +816,18 @@ app.get('/firebase/:coleccion', async (req, res) => {
 });
 
 // ─── Firestore: Insertar documento ──────────────────────────────────────────
-app.post('/firebase/:coleccion', async (req, res) => {
+app.post('/firebase/:coleccion', authenticateToken, async (req, res) => {
   try {
-    const ref = await db.collection(req.params.coleccion).add(req.body);
+    if (req.params.coleccion !== 'reservas') {
+      return res.status(403).json({ error: 'Colección no disponible para escritura' });
+    }
+    const ref = await db.collection('reservas').add({
+      ...req.body,
+      usuarioId: req.firebaseUid,
+      numeroControl: req.numeroControl,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
     res.json({ id: ref.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -813,9 +835,28 @@ app.post('/firebase/:coleccion', async (req, res) => {
 });
 
 // ─── Firestore: Actualizar documento por ID ──────────────────────────────────
-app.patch('/firebase/:coleccion/:id', async (req, res) => {
+app.patch('/firebase/:coleccion/:id', authenticateToken, async (req, res) => {
   try {
-    await db.collection(req.params.coleccion).doc(req.params.id).update(req.body);
+    const { coleccion, id } = req.params;
+
+    if (coleccion === 'usuarios') {
+      if (id !== req.firebaseUid) return res.status(403).json({ error: 'Solo puedes modificar tu propio perfil' });
+      const camposPermitidos = ['fotoUrl'];
+      const cambios = Object.fromEntries(camposPermitidos.filter((campo) => Object.prototype.hasOwnProperty.call(req.body, campo)).map((campo) => [campo, req.body[campo]]));
+      if (Object.keys(cambios).length === 0) return res.status(400).json({ error: 'No se recibieron campos permitidos' });
+      await db.collection('usuarios').doc(id).update({ ...cambios, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return res.json({ ok: true });
+    }
+
+    if (coleccion !== 'reservas') return res.status(403).json({ error: 'Colección no disponible para escritura' });
+    const ref = db.collection('reservas').doc(id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: 'Reserva no encontrada' });
+    if (doc.data().usuarioId !== req.firebaseUid) return res.status(403).json({ error: 'No puedes modificar esta reserva' });
+    const camposPermitidos = ['cancelada', 'canceladaEn'];
+    const cambios = Object.fromEntries(camposPermitidos.filter((campo) => Object.prototype.hasOwnProperty.call(req.body, campo)).map((campo) => [campo, req.body[campo]]));
+    if (Object.keys(cambios).length === 0) return res.status(400).json({ error: 'No se recibieron campos permitidos' });
+    await ref.update({ ...cambios, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -823,19 +864,28 @@ app.patch('/firebase/:coleccion/:id', async (req, res) => {
 });
 
 // ─── Firestore: Insertar multiples documentos en batch ───────────────────────
-app.post('/firebase/:coleccion/batch', async (req, res) => {
+app.post('/firebase/:coleccion/batch', authenticateToken, async (req, res) => {
   const { docs } = req.body;
   if (!Array.isArray(docs) || docs.length === 0) {
     return res.status(400).json({ error: 'Se requiere array "docs"' });
   }
 
   try {
-    const collection = db.collection(req.params.coleccion);
+    if (req.params.coleccion !== 'reservas') {
+      return res.status(403).json({ error: 'Colección no disponible para escritura por lote' });
+    }
+    const collection = db.collection('reservas');
     const batch = db.batch();
 
     docs.forEach(doc => {
       const ref = collection.doc();
-      batch.set(ref, { ...doc, creado: admin.firestore.FieldValue.serverTimestamp() });
+      batch.set(ref, {
+        ...doc,
+        usuarioId: req.firebaseUid,
+        numeroControl: req.numeroControl,
+        creado: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
     });
 
     await batch.commit();
@@ -949,10 +999,10 @@ app.post('/storage/upload', authenticateToken, upload.single('file'), async (req
 });
 
 // ─── Backblaze B2: Listar archivos ───────────────────────────────────────────
-app.get('/storage', async (req, res) => {
+app.get('/storage', authenticateToken, async (req, res) => {
   try {
     const data = await s3.send(new ListObjectsV2Command({ Bucket: B2_BUCKET }));
-    const files = (data.Contents || []).map(f => ({
+    const files = (data.Contents || []).filter((f) => f.Key?.startsWith(`perfiles/${req.firebaseUid}-`)).map(f => ({
       key: f.Key,
       size: f.Size,
       modified: f.LastModified,
@@ -964,8 +1014,11 @@ app.get('/storage', async (req, res) => {
 });
 
 // ─── Backblaze B2: URL firmada ───────────────────────────────────────────────
-app.get('/storage/url/:key', async (req, res) => {
+app.get('/storage/url/:key', authenticateToken, async (req, res) => {
   try {
+    if (!req.params.key.startsWith(`perfiles/${req.firebaseUid}-`)) {
+      return res.status(403).json({ error: 'No puedes acceder a este archivo' });
+    }
     const url = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: B2_BUCKET, Key: req.params.key }),
@@ -978,8 +1031,11 @@ app.get('/storage/url/:key', async (req, res) => {
 });
 
 // ─── Backblaze B2: Eliminar archivo ─────────────────────────────────────────
-app.delete('/storage/:key', async (req, res) => {
+app.delete('/storage/:key', authenticateToken, async (req, res) => {
   try {
+    if (!req.params.key.startsWith(`perfiles/${req.firebaseUid}-`)) {
+      return res.status(403).json({ error: 'No puedes eliminar este archivo' });
+    }
     await s3.send(new DeleteObjectCommand({ Bucket: B2_BUCKET, Key: req.params.key }));
     res.json({ message: 'Archivo eliminado' });
   } catch (err) {
