@@ -2,6 +2,8 @@ const express = require('express');
 
 const ROLES_ADMIN = ['presidente', 'vicepresidente', 'secretario', 'tesorero', 'difusion'];
 const TODOS_ADMIN = [...ROLES_ADMIN];
+const ROLES_ASIGNABLES = ['estudiante', ...ROLES_ADMIN];
+const ROLES_ASIGNABLES_VICEPRESIDENTE = ['estudiante', 'secretario', 'tesorero', 'difusion'];
 
 const RECURSOS = {
   proyectos: {
@@ -95,6 +97,13 @@ const RECURSOS = {
     rolesEscritura: ['difusion'],
     campos: ['solicitante', 'solicitanteRol', 'material', 'evento', 'limite', 'estado', 'comentario'],
     requeridos: ['solicitante', 'material'],
+  },
+  'solicitudes-actividad': {
+    coleccion: 'solicitudes_actividad',
+    rolesLectura: ['presidente', 'vicepresidente'],
+    rolesEscritura: [],
+    campos: [],
+    requeridos: [],
   },
   agenda: {
     rolesLectura: TODOS_ADMIN,
@@ -297,6 +306,99 @@ module.exports = function crearAdminRouter({ db, admin, authenticateToken }) {
     }
   });
 
+  // El alta de cargos siempre pasa por el backend. El alumno debe tener su
+  // correo verificado y el Vicepresidente no puede conceder un cargo directivo.
+  router.get('/alumnos', permitirRoles('presidente', 'vicepresidente'), async (req, res) => {
+    try {
+      const snapshot = await db.collection('usuarios').get();
+      const alumnos = snapshot.docs
+        .map(serializarDocumento)
+        .filter((item) => Boolean(item.email || item.correo) && item.numeroControl)
+        .map((item) => ({
+          id: item.id,
+          uid: item.uid || item.id,
+          nombre: item.nombre || 'Alumno sin nombre',
+          control: item.numeroControl || '',
+          correo: item.email || item.correo || '',
+          carrera: item.carrera || '',
+          semestre: item.semestre ?? null,
+          emailVerified: Boolean(item.emailVerified),
+          rol: ROLES_ADMIN.includes(normalizarRol(item.rol)) ? normalizarRol(item.rol) : 'estudiante',
+          createdAt: item.createdAt || null,
+        }))
+        .sort((a, b) => String(a.nombre).localeCompare(String(b.nombre), 'es'));
+      res.json(alumnos);
+    } catch (error) {
+      console.error('Admin student candidates list', error);
+      errorHttp(res, 500, 'No se pudo consultar a los alumnos registrados', 'ADMIN_STUDENT_LIST_ERROR');
+    }
+  });
+
+  router.patch('/alumnos/:uid/rol', permitirRoles('presidente', 'vicepresidente'), async (req, res) => {
+    const uid = String(req.params.uid || '').trim();
+    const nuevoRol = normalizarRol(req.body?.rol || 'estudiante');
+    const rolesPermitidos = req.actor.rol === 'presidente' ? ROLES_ASIGNABLES : ROLES_ASIGNABLES_VICEPRESIDENTE;
+
+    if (!uid) return errorHttp(res, 400, 'Falta el identificador del alumno', 'ADMIN_VALIDATION_ERROR');
+    if (!rolesPermitidos.includes(nuevoRol)) return errorHttp(res, 403, 'Ese cargo no puede ser asignado desde tu puesto', 'ADMIN_ROLE_ASSIGNMENT_FORBIDDEN');
+    if (uid === req.actor.uid) return errorHttp(res, 409, 'No puedes cambiar tu propio cargo desde esta sección', 'ADMIN_SELF_ROLE_CHANGE');
+
+    try {
+      const authUser = await admin.auth().getUser(uid);
+      if (!authUser.emailVerified) return errorHttp(res, 409, 'El alumno debe verificar su correo antes de recibir un cargo', 'ADMIN_EMAIL_VERIFICATION_REQUIRED');
+
+      const perfilRef = db.collection('usuarios').doc(uid);
+      const auditoriaRef = coleccionAdmin('asignaciones_roles').doc();
+      let anteriorRol = 'estudiante';
+
+      await db.runTransaction(async (transaction) => {
+        const perfilDoc = await transaction.get(perfilRef);
+        if (!perfilDoc.exists) {
+          const error = new Error('ADMIN_TARGET_NOT_FOUND');
+          error.code = 'ADMIN_TARGET_NOT_FOUND';
+          throw error;
+        }
+
+        const perfil = perfilDoc.data();
+        anteriorRol = ROLES_ADMIN.includes(normalizarRol(perfil.rol)) ? normalizarRol(perfil.rol) : 'estudiante';
+        if (req.actor.rol === 'vicepresidente' && anteriorRol === 'presidente') {
+          const error = new Error('ADMIN_TARGET_PRESIDENT');
+          error.code = 'ADMIN_TARGET_PRESIDENT';
+          throw error;
+        }
+
+        const ahora = admin.firestore.FieldValue.serverTimestamp();
+        transaction.update(perfilRef, {
+          rol: nuevoRol,
+          emailVerified: Boolean(perfil.emailVerified) || Boolean(authUser.emailVerified),
+          updatedAt: ahora,
+          updatedBy: req.actor.uid,
+          updatedByRole: req.actor.rol,
+        });
+        transaction.set(auditoriaRef, {
+          uid,
+          nombre: perfil.nombre || authUser.displayName || 'Alumno',
+          numeroControl: perfil.numeroControl || null,
+          rolAnterior: anteriorRol,
+          rolNuevo: nuevoRol,
+          actorUid: req.actor.uid,
+          actorNombre: req.actor.nombre,
+          actorRol: req.actor.rol,
+          createdAt: ahora,
+        });
+      });
+
+      const actualizado = await perfilRef.get();
+      res.json({ id: actualizado.id, ...serializarValor(actualizado.data()), rolAnterior: anteriorRol });
+    } catch (error) {
+      if (error.code === 'ADMIN_TARGET_NOT_FOUND') return errorHttp(res, 404, 'No se encontró el perfil del alumno', 'ADMIN_NOT_FOUND');
+      if (error.code === 'ADMIN_TARGET_PRESIDENT') return errorHttp(res, 403, 'El Vicepresidente no puede modificar el cargo del Presidente', 'ADMIN_ROLE_ASSIGNMENT_FORBIDDEN');
+      if (error.code === 'auth/user-not-found') return errorHttp(res, 404, 'No se encontró la cuenta del alumno', 'ADMIN_NOT_FOUND');
+      console.error('Admin role assignment', error);
+      errorHttp(res, 500, 'No se pudo actualizar el cargo del alumno', 'ADMIN_ROLE_ASSIGNMENT_ERROR');
+    }
+  });
+
   router.get('/aprobaciones', async (req, res) => {
     try {
       const snapshot = await coleccionAdmin('aprobaciones').get();
@@ -389,6 +491,16 @@ module.exports = function crearAdminRouter({ db, admin, authenticateToken }) {
           timestamp: ahora,
           createdAt: ahora,
         });
+        if (aprobacion.origen === 'solicitud-actividad' && aprobacion.origenId) {
+          const solicitudRef = coleccionAdmin('solicitudes_actividad').doc(aprobacion.origenId);
+          transaction.set(solicitudRef, {
+            estado,
+            comentarioMesa: comentario,
+            resolvedAt: ahora,
+            resolvedBy: req.actor.uid,
+            updatedAt: ahora,
+          }, { merge: true });
+        }
       });
 
       const actualizado = await aprobacionRef.get();

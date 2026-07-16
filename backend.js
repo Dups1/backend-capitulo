@@ -762,6 +762,109 @@ app.get('/usuarios/me', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── Alumnos: solicitudes de actividades para la Mesa Directiva ────────────
+const CAPITULO_ID = process.env.CAPITULO_ID || 'isc';
+const coleccionCapitulo = (nombre) => db.collection('capitulos').doc(CAPITULO_ID).collection(nombre);
+
+function serializarSolicitud(doc) {
+  const datos = doc.data();
+  return {
+    id: doc.id,
+    ...datos,
+    createdAt: datos.createdAt?.toDate?.().toISOString?.() || datos.createdAt || null,
+    updatedAt: datos.updatedAt?.toDate?.().toISOString?.() || datos.updatedAt || null,
+    resolvedAt: datos.resolvedAt?.toDate?.().toISOString?.() || datos.resolvedAt || null,
+  };
+}
+
+app.post('/solicitudes-actividad', authenticateToken, async (req, res) => {
+  const camposPermitidos = [
+    'nombreActividad', 'tipoSolicitud', 'fechaTentativa', 'descripcion', 'objetivo',
+    'publicoObjetivo', 'modalidad', 'duracion', 'recursos', 'asesoria', 'comentarios', 'semestre',
+  ];
+  const datos = Object.fromEntries(camposPermitidos
+    .filter((campo) => Object.prototype.hasOwnProperty.call(req.body || {}, campo))
+    .map((campo) => [campo, req.body[campo]]));
+  const faltante = ['nombreActividad', 'tipoSolicitud', 'descripcion', 'objetivo']
+    .find((campo) => !String(datos[campo] || '').trim());
+  if (faltante) return res.status(400).json({ error: `El campo ${faltante} es obligatorio` });
+  if (datos.recursos !== undefined && !Array.isArray(datos.recursos)) {
+    return res.status(400).json({ error: 'Los recursos deben enviarse como una lista' });
+  }
+
+  try {
+    const perfilDoc = await db.collection('usuarios').doc(req.firebaseUid).get();
+    if (!perfilDoc.exists) return res.status(403).json({ error: 'No se encontró el perfil del alumno' });
+    const perfil = perfilDoc.data();
+    const solicitudRef = coleccionCapitulo('solicitudes_actividad').doc();
+    const aprobacionRef = coleccionCapitulo('aprobaciones').doc();
+    const notificacionRef = coleccionCapitulo('notificaciones').doc();
+    const ahora = admin.firestore.FieldValue.serverTimestamp();
+    const fecha = new Date().toISOString().slice(0, 10);
+    const estudiante = perfil.nombre || req.firebaseUser.name || 'Alumno ISC';
+
+    const batch = db.batch();
+    batch.set(solicitudRef, {
+      ...datos,
+      estudiante,
+      correo: perfil.email || req.firebaseUser.email,
+      numeroControl: perfil.numeroControl || req.numeroControl,
+      semestre: datos.semestre ?? perfil.semestre ?? null,
+      usuarioUid: req.firebaseUid,
+      aprobacionId: aprobacionRef.id,
+      estado: 'Pendiente',
+      createdAt: ahora,
+      updatedAt: ahora,
+    });
+    batch.set(aprobacionRef, {
+      area: 'Actividades',
+      tipo: 'Actividad estudiantil',
+      solicitante: estudiante,
+      resumen: `${datos.tipoSolicitud}: ${datos.nombreActividad}`,
+      descripcion: datos.descripcion,
+      monto: 0,
+      fecha,
+      solicitanteRol: 'estudiante',
+      solicitanteUid: req.firebaseUid,
+      destinatarioRol: 'presidente',
+      origen: 'solicitud-actividad',
+      origenId: solicitudRef.id,
+      estado: 'Pendiente',
+      createdAt: ahora,
+      updatedAt: ahora,
+    });
+    batch.set(notificacionRef, {
+      rol: 'presidente',
+      usuarioUid: null,
+      tipo: 'solicitud-actividad',
+      mensaje: `${estudiante} envió la solicitud "${datos.nombreActividad}".`,
+      leida: false,
+      timestamp: ahora,
+      createdAt: ahora,
+    });
+    await batch.commit();
+
+    const creado = await solicitudRef.get();
+    res.status(201).json(serializarSolicitud(creado));
+  } catch (error) {
+    console.error('Student activity request create', error);
+    res.status(500).json({ error: 'No se pudo registrar la solicitud de actividad' });
+  }
+});
+
+app.get('/solicitudes-actividad/mias', authenticateToken, async (req, res) => {
+  try {
+    const snapshot = await coleccionCapitulo('solicitudes_actividad').where('usuarioUid', '==', req.firebaseUid).get();
+    const solicitudes = snapshot.docs
+      .map(serializarSolicitud)
+      .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    res.json(solicitudes);
+  } catch (error) {
+    console.error('Student activity request list', error);
+    res.status(500).json({ error: 'No se pudieron consultar tus solicitudes de actividad' });
+  }
+});
+
 // ─── Mesa Directiva: API administrativa con permisos por puesto ─────────────
 app.use('/admin/v1', crearAdminRouter({ db, admin, authenticateToken }));
 
